@@ -24,6 +24,7 @@ from .lbfgs import LBFGS
 from .momentum import Momentum
 from .muon import Muon
 from .nadam import NAdam
+from .normuon import NorMuon
 from .optimizer import Optimizer
 from .radam import RAdam
 from .rmsprop import RMSProp
@@ -47,4 +48,5 @@ __all__ = [
     'Lamb',
     'LBFGS',
     'Muon',
+    'NorMuon',
 ]
