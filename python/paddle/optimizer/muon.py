@@ -15,6 +15,8 @@ from __future__ import annotations
 
 import logging
 import os
+from functools import lru_cache
+from math import inf, sqrt
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -25,6 +27,7 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from paddle import Tensor
 
+import numpy as np
 import paddle
 from paddle import _C_ops
 from paddle.base import framework
@@ -111,6 +114,107 @@ _NS_COEFFICIENT_SETS = {
     [(3.4445, -4.7750, 2.0315)] * 8 + [(2.0, -1.5, 0.5)] * 2,
 }
 
+# Sentinel value identifying the Polar Express path. Coefficients are
+# generated on-the-fly via _compute_polar_express_coeffs(...).
+# Reference: https://arxiv.org/abs/2505.16932 ("The Polar Express")
+POLAR_EXPRESS_V3 = "polar_express_v3"
+
+
+# ------------------------------------------------------------------
+# Polar Express coefficient generation (Remez-based, numpy)
+# ------------------------------------------------------------------
+# These helpers are direct ports of NoahAmsel/PolarExpress' polar_express.py.
+# They run on the host (numpy) once per (num_iters, l, ...) tuple and the
+# results are cached. The actual GPU iteration uses a fixed list of (a,b,c)
+# tuples just like the existing NS path.
+
+
+def _optimal_quintic(l: float, u: float):
+    """Optimal odd quintic approximation to the constant 1 over [l, u].
+
+    Returns (a, b, c) such that p(x) = a*x + b*x^3 + c*x^5 minimises the
+    max approximation error to f(x) = 1 on [l, u]. Solved with a simplified
+    Remez iteration.
+    """
+    assert 0 <= l <= u
+    if 1 - 5e-6 <= l / u:
+        return (15 / 8) / u, (-10 / 8) / (u**3), (3 / 8) / (u**5)
+
+    q = (3 * l + u) / 4
+    r = (l + 3 * u) / 4
+    E, old_E = inf, None
+    while not old_E or abs(old_E - E) > 1e-15:
+        old_E = E
+        LHS = np.array(
+            [
+                [l, l**3, l**5, 1],
+                [q, q**3, q**5, -1],
+                [r, r**3, r**5, 1],
+                [u, u**3, u**5, -1],
+            ]
+        )
+        a, b, c, E = np.linalg.solve(LHS, np.ones(4))
+        disc = 9 * b**2 - 20 * a * c
+        if disc < 0:
+            break
+        q, r = np.sqrt((-3 * b + np.array([-1, 1]) * sqrt(disc)) / (10 * c))
+    return float(a), float(b), float(c)
+
+
+def _optimal_composition(
+    l: float,
+    num_iters: int,
+    safety_factor_eps: float = 0.0,
+    cushion: float = 0.0,
+):
+    """Generate the per-iteration (a, b, c) coefficients for Polar Express.
+
+    See "The Polar Express" paper. ``l`` is a lower bound on the smallest
+    singular value of the (already normalised) input matrix. ``num_iters`` is
+    the polynomial composition depth. ``safety_factor_eps`` shrinks the
+    polynomial slightly between iterations to absorb numerical error;
+    ``cushion`` lets the algorithm "give up" on resolving very small
+    singular values to keep the polynomial well-conditioned.
+    """
+    u = 1.0
+    assert 0 <= l <= u
+    safety_factor = 1.0 + safety_factor_eps
+    coefficients = []
+    for it in range(num_iters):
+        a, b, c = _optimal_quintic(max(l, cushion * u), u)
+        if cushion * u > l:
+            pl = a * l + b * l**3 + c * l**5
+            pu = a * u + b * u**3 + c * u**5
+            rescaler = 2.0 / (pl + pu)
+            a *= rescaler
+            b *= rescaler
+            c *= rescaler
+        if it < num_iters - 1:
+            a /= safety_factor
+            b /= safety_factor**3
+            c /= safety_factor**5
+        coefficients.append((float(a), float(b), float(c)))
+        l = a * l + b * l**3 + c * l**5
+        u = 2.0 - l
+    return coefficients
+
+
+@lru_cache(maxsize=64)
+def _compute_polar_express_coeffs(
+    num_iters: int,
+    l: float,
+    safety_factor_eps: float,
+    cushion: float,
+):
+    """Cached entry-point used by the Muon update."""
+    return _optimal_composition(
+        l=l,
+        num_iters=num_iters,
+        safety_factor_eps=safety_factor_eps,
+        cushion=cushion,
+    )
+
+
 # ------------------------------------------------------------------
 # Default parameter classification
 # ------------------------------------------------------------------
@@ -173,7 +277,11 @@ class Muon(Optimizer):
         ns_steps (int): Newton-Schulz iteration steps. Default: ``5``.
         ns_coeff_type (str): Preset name for Newton-Schulz coefficients.
             Options: ``"simple"``, ``"quintic"``, ``"polar_express"``,
-            ``"aol"``, ``"deepseekv4"``, ``"custom"``. Default: ``"simple"``.
+            ``"aol"``, ``"deepseekv4"``, ``"custom"`` (all run the existing
+            Newton-Schulz path with row-wise L2 normalisation), or
+            ``"polar_express_v3"`` (Polar Express iteration with
+            spectral-norm normalisation; coefficients are generated via
+            Remez and cached). Default: ``"simple"``.
         ns_coeffs (list[tuple[float, float, float]] | None): Custom
             Newton-Schulz coefficient set. Each tuple is ``(a, b, c)``
             for one iteration step. Default: ``None``.
@@ -199,6 +307,17 @@ class Muon(Optimizer):
             iterations. ``None`` = auto-detect: bfloat16 on Ampere+ (capability
             >= 8.0), float32 on V100 and older. Pass ``paddle.float32``
             explicitly to force float32. Default: ``None``.
+        polar_express_l (float): Lower bound on the smallest normalised
+            singular value used to seed the Remez coefficient search. Used
+            only when ``ns_coeff_type == "polar_express_v3"``. Default: ``1e-3``.
+        polar_express_safety_factor_eps (float): Per-iteration safety shrink
+            (``safety_factor = 1 + eps``) for Polar Express. Default: ``0.01``.
+        polar_express_cushion (float): Cushion for the Remez search; lets
+            very small singular values be ignored to keep polynomials
+            well-conditioned. Default: ``0.02``.
+        polar_express_norm_safety (float): Multiplicative safety factor on
+            the Frobenius-norm upper bound used for spectral normalisation
+            (``X / (||X||_F * safety + eps)``). Default: ``1.01``.
         multi_precision (bool): Maintain FP32 master weights when training in
             BF16/FP16. Default: ``False``.
         name (str | None): Optional name for the optimizer instance.
@@ -230,6 +349,10 @@ class Muon(Optimizer):
         muon_extra_scale_factor=0.2,
         muon_param_info_map: MuonParamInfoMap | None = None,
         ns_matmul_dtype=None,
+        polar_express_l: float = 1e-3,
+        polar_express_safety_factor_eps: float = 0.01,
+        polar_express_cushion: float = 0.02,
+        polar_express_norm_safety: float = 1.01,
         multi_precision=False,
         name=None,
         **kwargs,
@@ -280,7 +403,10 @@ class Muon(Optimizer):
         self._muon_exclude_patterns = muon_exclude_patterns
         self._muon_extra_scale_factor = muon_extra_scale_factor
         self._ns_coeff_type = ns_coeff_type
-        if ns_coeff_type == "custom":
+        if ns_coeff_type == POLAR_EXPRESS_V3:
+            # Coefficients are computed on-the-fly via Remez; no preset list.
+            self._ns_coeffs = None
+        elif ns_coeff_type == "custom":
             assert ns_coeffs is not None, (
                 "ns_coeffs must be provided when ns_coeff_type is 'custom'."
             )
@@ -291,6 +417,13 @@ class Muon(Optimizer):
             )
             self._ns_coeffs = _NS_COEFFICIENT_SETS[ns_coeff_type]
         self._muon_param_info_map = muon_param_info_map or {}
+        # Polar Express hyper-parameters (only used if ns_coeff_type == POLAR_EXPRESS_V3)
+        self._polar_express_l = float(polar_express_l)
+        self._polar_express_safety_factor_eps = float(
+            polar_express_safety_factor_eps
+        )
+        self._polar_express_cushion = float(polar_express_cushion)
+        self._polar_express_norm_safety = float(polar_express_norm_safety)
         # Dtype for Newton-Schulz matmul.
         # None = auto: bfloat16 on Ampere+ (capability >= 8.0), float32 on older.
         if ns_matmul_dtype is None:
@@ -423,6 +556,53 @@ class Muon(Optimizer):
         return X.T if transpose else X
 
     @staticmethod
+    def _zeropower_via_polar_express(
+        X,
+        steps,
+        coeffs,
+        norm_safety=1.01,
+        eps=1e-7,
+        ns_matmul_dtype=paddle.bfloat16,
+    ):
+        """Polar Express iteration for the matrix sign function.
+
+        Differs from :func:`_zeropower_via_newtonschulz5` in two ways:
+
+        1. The input is normalised by an upper bound on the spectral norm
+           (Frobenius norm * ``norm_safety``), not row-wise L2-normalised.
+           This is required for Polar Express to converge to ``sign(X)``.
+        2. The (a, b, c) coefficients vary per iteration and are derived
+           offline from the Remez algorithm (see :func:`_optimal_composition`).
+           If ``steps`` exceeds ``len(coeffs)``, the last coefficient triple
+           is repeated.
+        """
+        if X.shape[-2] > X.shape[-1]:
+            X = X.T
+            transpose = True
+        else:
+            transpose = False
+
+        # Spectral-norm normalisation: ||X||_2 <= ||X||_F.
+        x_dtype = X.dtype
+        X = X.astype(paddle.float32)
+        fro = paddle.linalg.norm(X.reshape([-1]), p=2)
+        X = X / (fro * norm_safety + eps)
+        X = X.astype(ns_matmul_dtype)
+
+        if steps <= len(coeffs):
+            hs = coeffs[:steps]
+        else:
+            hs = list(coeffs) + [coeffs[-1]] * (steps - len(coeffs))
+
+        for a, b, c in hs:
+            A = paddle.matmul(X, X, transpose_y=True)
+            B = paddle.addmm(input=A, x=A, y=A, beta=b, alpha=c)
+            X = paddle.addmm(input=X, x=B, y=X, beta=a, alpha=1.0)
+
+        X = X.astype(x_dtype)
+        return X.T if transpose else X
+
+    @staticmethod
     def _scaling_fn(orthogonal_update, version, extra_scale_factor=1.0):
         """Apply dimension-dependent scaling to the orthogonal update."""
         din, dout = orthogonal_update.shape[0], orthogonal_update.shape[1]
@@ -535,15 +715,35 @@ class Muon(Optimizer):
             # are already 2D/3D (no sharding gather needed).
             matrix_2d_global = update_buffer.reshape(param_shape)
 
+            # Pick the orthogonalisation iteration based on ns_coeff_type.
+            use_polar_express = self._ns_coeff_type == POLAR_EXPRESS_V3
+            if use_polar_express:
+                pe_coeffs = _compute_polar_express_coeffs(
+                    int(ns_steps),
+                    self._polar_express_l,
+                    self._polar_express_safety_factor_eps,
+                    self._polar_express_cushion,
+                )
+
             # Shared NS + scaling closure (captures ns_steps, epsilon, version, ns_coeffs)
             def ortho_fn(m):
-                ns_out = Muon._zeropower_via_newtonschulz5(
-                    m,
-                    steps=ns_steps,
-                    eps=epsilon,
-                    ns_coeffs=self._ns_coeffs,
-                    ns_matmul_dtype=self._ns_matmul_dtype,
-                )
+                if use_polar_express:
+                    ns_out = Muon._zeropower_via_polar_express(
+                        m,
+                        steps=ns_steps,
+                        coeffs=pe_coeffs,
+                        norm_safety=self._polar_express_norm_safety,
+                        eps=epsilon,
+                        ns_matmul_dtype=self._ns_matmul_dtype,
+                    )
+                else:
+                    ns_out = Muon._zeropower_via_newtonschulz5(
+                        m,
+                        steps=ns_steps,
+                        eps=epsilon,
+                        ns_coeffs=self._ns_coeffs,
+                        ns_matmul_dtype=self._ns_matmul_dtype,
+                    )
                 scaled = Muon._scaling_fn(
                     ns_out, version, self._muon_extra_scale_factor
                 )
